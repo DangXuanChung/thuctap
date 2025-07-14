@@ -1,0 +1,9 @@
+void setup() {
+  Serial.begin(115200);
+
+  // ... các cấu hình chân relay, TFT, cảm biến khác ...
+
+  // Cấu hình nút nhấn
+  pinMode(BUTTON1_PIN, INPUT_PULLUP); // Nút nhấn SW2 (GPIO0)
+  pinMode(BUTTON2_PIN, INPUT_PULLUP); // Nút nhấn SW3 (GPIO14)
+}
