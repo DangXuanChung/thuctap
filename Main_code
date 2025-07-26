@@ -1,1 +1,258 @@
+#include <stdio.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <driver/gpio.h>
+#include <driver/i2c.h>
+#include <driver/spi_master.h>
+#include <driver/adc.h>
+#include "sdkconfig.h"
+#include "esp_log.h"
+#include "aht20.h"
+#include "bmp280.h"
+#include "tft.h"
 
+// GPIO definitions based on schematic
+#define BUTTON_SW3 GPIO_NUM_7
+#define BUTTON_SW4 GPIO_NUM_6
+#define RELAY_1 GPIO_NUM_21
+#define RELAY_2 GPIO_NUM_46
+#define LDR_PIN GPIO_NUM_4
+#define I2C_SDA GPIO_NUM_36
+#define I2C_SCL GPIO_NUM_35
+#define TFT_DC GPIO_NUM_8
+#define TFT_MOSI GPIO_NUM_9
+#define TFT_SCK GPIO_NUM_10
+#define TFT_CS GPIO_NUM_11
+#define TFT_RESET GPIO_NUM_17
+
+// Constants
+#define TEMP_THRESHOLD 30.0f // Auto mode: fan on if temp > 30°C
+#define LIGHT_THRESHOLD 100  // Auto mode: light on if < 100 lux
+#define DEBOUNCE_DELAY_MS 100
+#define LONG_PRESS_TIME_MS 3000
+#define FILTER_SIZE 5
+
+// Global variables
+static bool auto_mode = false;
+static bool relay1_state = false; // Fan
+static bool relay2_state = false; // Light
+static uint32_t last_debounce_sw3 = 0;
+static uint32_t last_debounce_sw4 = 0;
+static uint32_t button_press_start = 0;
+static bool last_button_state_sw3 = true;
+static bool last_button_state_sw4 = true;
+static float temp_buffer[FILTER_SIZE] = {0};
+static float pressure_buffer[FILTER_SIZE] = {0};
+static int buffer_index = 0;
+
+static const char *TAG = "ENV_MONITOR";
+
+// I2C and SPI handles
+static i2c_port_t i2c_port = I2C_NUM_0;
+static spi_device_handle_t spi_tft;
+
+// Function prototypes
+void init_gpio(void);
+void init_i2c(void);
+void init_spi_tft(void);
+void update_tft(float temp, float humidity, float pressure, int light);
+float read_filtered_bmp_temp(void);
+float read_filtered_bmp_pressure(void);
+void button_task(void *pvParameters);
+void sensor_task(void *pvParameters);
+
+void app_main(void) {
+    // Initialize hardware
+    init_gpio();
+    init_i2c();
+    init_spi_tft();
+    tft_init(spi_tft, TFT_CS, TFT_DC, TFT_RESET);
+
+    // Display initial message
+    tft_fill_screen(TFT_BLACK);
+    tft_set_text_color(TFT_WHITE, TFT_BLACK);
+    tft_set_text_size(2);
+    tft_set_cursor(0, 0);
+    tft_print("Environmental Monitor");
+
+    // Create tasks
+    xTaskCreate(button_task, "button_task", 4096, NULL, 5, NULL);
+    xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 5, NULL);
+}
+
+void init_gpio(void) {
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << BUTTON_SW3) | (1ULL << BUTTON_SW4),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    gpio_config(&io_conf);
+
+    io_conf.pin_bit_mask = (1ULL << RELAY_1) | (1ULL << RELAY_2);
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&io_conf);
+
+    gpio_set_level(RELAY_1, 0);
+    gpio_set_level(RELAY_2, 0);
+
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(ADC1_CHANNEL_3, ADC_ATTEN_DB_11); // LDR on GPIO4
+}
+
+void init_i2c(void) {
+    i2c_config_t conf = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA,
+        .scl_io_num = I2C_SCL,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 100000
+    };
+    i2c_param_config(i2c_port, &conf);
+    i2c_driver_install(i2c_port, I2C_MODE_MASTER, 0, 0, 0);
+
+    // Initialize AHT20
+    if (aht20_init(i2c_port) != ESP_OK) {
+        ESP_LOGE(TAG, "AHT20 initialization failed");
+    }
+
+    // Initialize BMP280
+    if (bmp280_init(i2c_port, 0x76) != ESP_OK) {
+        ESP_LOGE(TAG, "BMP280 initialization failed");
+    }
+}
+
+void init_spi_tft(void) {
+    spi_bus_config_t buscfg = {
+        .miso_io_num = -1,
+        .mosi_io_num = TFT_MOSI,
+        .sclk_io_num = TFT_SCK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1
+    };
+    spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO);
+
+    spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = 10 * 1000 * 1000,
+        .mode = 0,
+        .spics_io_num = TFT_CS,
+        .queue_size = 7
+    };
+    spi_bus_add_device(SPI2_HOST, &devcfg, &spi_tft);
+}
+
+void button_task(void *pvParameters) {
+    while (1) {
+        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        bool button_state_sw3 = gpio_get_level(BUTTON_SW3);
+        bool button_state_sw4 = gpio_get_level(BUTTON_SW4);
+
+        // Check for long press to toggle mode
+        if (!button_state_sw3 && !button_state_sw4) {
+            if (button_press_start == 0) {
+                button_press_start = current_time;
+            } else if (current_time - button_press_start >= LONG_PRESS_TIME_MS) {
+                auto_mode = !auto_mode;
+                tft_fill_screen(TFT_BLACK);
+                tft_set_cursor(0, 0);
+                tft_print(auto_mode ? "Mode: AUTO" : "Mode: MANUAL");
+                button_press_start = 0;
+            }
+        } else {
+            button_press_start = 0;
+        }
+
+        // Handle buttons in manual mode
+        if (!auto_mode) {
+            if (button_state_sw3 != last_button_state_sw3 && current_time - last_debounce_sw3 > DEBOUNCE_DELAY_MS) {
+                if (!button_state_sw3) {
+                    relay1_state = !relay1_state;
+                    gpio_set_level(RELAY_1, relay1_state);
+                }
+                last_debounce_sw3 = current_time;
+            }
+            if (button_state_sw4 != last_button_state_sw4 && current_time - last_debounce_sw4 > DEBOUNCE_DELAY_MS) {
+                if (!button_state_sw4) {
+                    relay2_state = !relay2_state;
+                    gpio_set_level(RELAY_2, relay2_state);
+                }
+                last_debounce_sw4 = current_time;
+            }
+        }
+
+        last_button_state_sw3 = button_state_sw3;
+        last_button_state_sw4 = button_state_sw4;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void sensor_task(void *pvParameters) {
+    while (1) {
+        // Read sensors
+        float temp, humidity;
+        aht20_read(&temp, &humidity);
+        float bmp_temp = read_filtered_bmp_temp();
+        float bmp_pressure = read_filtered_bmp_pressure();
+        int ldr_value = adc1_get_raw(ADC1_CHANNEL_3) * 1000 / 4095; // Approximate lux
+
+        // Auto mode: control relays
+        if (auto_mode) {
+            relay1_state = (temp > TEMP_THRESHOLD);
+            relay2_state = (ldr_value < LIGHT_THRESHOLD);
+            gpio_set_level(RELAY_1, relay1_state);
+            gpio_set_level(RELAY_2, relay2_state);
+        }
+
+        // Update TFT
+        update_tft(temp, humidity, bmp_pressure, ldr_value);
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+void update_tft(float temp, float humidity, float pressure, int light) {
+    char buffer[64];
+    tft_fill_screen(TFT_BLACK);
+    tft_set_cursor(0, 0);
+    sprintf(buffer, "%s", auto_mode ? "Mode: AUTO" : "Mode: MANUAL");
+    tft_print(buffer);
+    sprintf(buffer, "Temp: %.1f C", temp);
+    tft_print(buffer);
+    sprintf(buffer, "Humidity: %.1f %%", humidity);
+    tft_print(buffer);
+    sprintf(buffer, "Pressure: %.1f hPa", pressure);
+    tft_print(buffer);
+    sprintf(buffer, "Light: %d lux", light);
+    tft_print(buffer);
+    sprintf(buffer, "Fan: %s", relay1_state ? "ON" : "OFF");
+    tft_print(buffer);
+    sprintf(buffer, "Light: %s", relay2_state ? "ON" : "OFF");
+    tft_print(buffer);
+}
+
+float read_filtered_bmp_temp() {
+    float temp;
+    bmp280_read_temperature(&temp);
+    temp_buffer[buffer_index] = temp;
+    buffer_index = (buffer_index + 1) % FILTER_SIZE;
+    float sum = 0;
+    for (int i = 0; i < FILTER_SIZE; i++) {
+        sum += temp_buffer[i];
+    }
+    return sum / FILTER_SIZE;
+}
+
+float read_filtered_bmp_pressure() {
+    float pressure;
+    bmp280_read_pressure(&pressure);
+    pressure_buffer[buffer_index] = pressure / 100.0; // Convert to hPa
+    buffer_index = (buffer_index + 1) % FILTER_SIZE;
+    float sum = 0;
+    for (int i = 0; i < FILTER_SIZE; i++) {
+        sum += pressure_buffer[i];
+    }
+    return sum / FILTER_SIZE;
+}
