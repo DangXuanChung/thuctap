@@ -57,8 +57,7 @@ void app_main()
 {
     ESP_LOGI("APP", "app_main start");
 
-   // blink_bl_once(); // test BL sớm, như bạn đã thêm
-
+   // blink_bl_once(); // test BL sớm
     ESP_ERROR_CHECK(i2cdev_init());
 
     ESP_LOGI("APP", "calling display_init");
@@ -69,6 +68,6 @@ void app_main()
     xTaskCreatePinnedToCore(task, TAG,
         configMINIMAL_STACK_SIZE * 8, NULL, 5, NULL, APP_CPU_NUM);
 
-    ESP_LOGI("APP", "leaving app_main");   // bạn sẽ nhìn thấy dòng này
+    ESP_LOGI("APP", "leaving app_main");  
 }
 
