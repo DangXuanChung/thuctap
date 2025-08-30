@@ -6,7 +6,7 @@
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 
-// ==== GPIO mapping theo sơ đồ của bạn ====
+// ==== GPIO mapping ====
 #define LCD_PIN_SCLK   10   // IO10
 #define LCD_PIN_MOSI    9   // IO9
 #define LCD_PIN_CS     11   // IO11
@@ -45,3 +45,4 @@ void      m5_lcd_fill(uint16_t color);
 void      m5_lcd_fill_rect(int x, int y, int w, int h, uint16_t color);
 void      m5_lcd_draw_string(int x, int y, const char *text,
                              uint16_t fg, uint16_t bg, int size12, bool transparent);
+
