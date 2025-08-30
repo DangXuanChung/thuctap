@@ -10,7 +10,7 @@
 #if !defined(LOG_LOCAL_LEVEL) && defined(CONFIG_LOG_MAXIMUM_LEVEL)
 #define LOG_LOCAL_LEVEL CONFIG_LOG_MAXIMUM_LEVEL
 #endif
-// ==== PHẦN CỨNG (theo schematic bạn gửi) ====
+// ==== PHẦN CỨNG====
 #define LDR_GPIO     4                   // IO4
 #define LDR_UNIT     ADC_UNIT_1
 #define LDR_CHANNEL  ADC_CHANNEL_3       // ESP32-S3: IO4 = ADC1_CH3
@@ -88,3 +88,4 @@ int ldr_read_percent(void)
     int mv = ldr_read_mv_filtered();
     return ldr_percent_from_mv(mv);
 }
+
